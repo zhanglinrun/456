@@ -1,72 +1,91 @@
-function [best_signal, strategy_name, best_improvement] = dynamic_anti_jamming(received_signal, reference_chip, clean_signal_ground_truth, fs, B)
-% DYNAMIC_ANTI_JAMMING 动态抗干扰 (逻辑修正版)
-% 修复了“尖峰 vs 宽脉冲”导致评分极低的问题
+function [best_pc, strategy_name, sinr_improvement_db, sinr_base_db, sinr_best_db] = dynamic_anti_jamming(rx, reference_chip, clean_tx)
+%DYNAMIC_ANTI_JAMMING  Dynamic anti-jamming strategy selection (simulation)
+%   This function selects the best post-processing strategy in the
+%   pulse-compressed (range) domain, using the known clean transmit/reference
+%   waveform clean_tx as ground truth (only available in simulation).
+%
+% Outputs:
+%   best_pc            : best pulse-compressed output (range profile)
+%   strategy_name      : 'PC' | 'SLC' | 'SLB' | 'SLC+SLB'
+%   sinr_improvement_db: SINR_best - SINR_base (dB)
+%   sinr_base_db       : baseline SINR (PC only) (dB)
+%   sinr_best_db       : best SINR (dB)
+%
+% Why update:
+%   - Your previous version used correlation-difference * 100 as "improvement",
+%     which is not dB and cannot support a "\ge 6 dB" claim.
+%   - Here we compute an SINR-like metric in range domain.
 
-    % --- 关键修正：生成“理想参考标准” ---
-    % 我们不能拿“处理后的信号”去跟“原始宽脉冲”比，因为形状变了。
-    % 我们必须跟“理想的脉冲压缩结果”比。
-    ideal_compressed = pulse_compression(clean_signal_ground_truth, reference_chip, fs);
+    rx = rx(:).';
+    reference_chip = reference_chip(:).';
+    clean_tx = clean_tx(:).';
 
-    % 计算基准分 (原始带噪信号 vs 理想结果)
-    base_corr = get_correlation(received_signal, ideal_compressed);
+    % Ideal compressed target response (simulation ground truth)
+    ideal = pulse_compression(clean_tx, reference_chip);
+    [~, main_idx] = max(abs(ideal));
+    guard_half = max(8, round(length(rx) * 0.01)); % protect ~1% of length
 
-    %% 策略 1: 仅脉冲压缩
-    try
-        sig_pc = pulse_compression(received_signal, reference_chip, fs);
-        sig_pc = normalize_energy(sig_pc, received_signal);
-        score_pc = get_correlation(sig_pc, ideal_compressed); % 跟理想结果比
-    catch
-        score_pc = -2; sig_pc = received_signal;
-    end
+    % Baseline: pulse compression only
+    pc = pulse_compression(rx, reference_chip);
+    sinr_base_db = estimate_sinr_db(pc, ideal, main_idx, guard_half);
 
-    %% 策略 2: 副瓣对消 + 脉冲压缩
-    try
-        sig_slc_raw = sidelobe_cancellation(received_signal, clean_signal_ground_truth, fs, B);
-        sig_slc_pc = pulse_compression(sig_slc_raw, reference_chip, fs);
-        sig_slc_pc = normalize_energy(sig_slc_pc, received_signal);
-        score_slc = get_correlation(sig_slc_pc, ideal_compressed);
-    catch
-        score_slc = -2; sig_slc_pc = received_signal;
-    end
+    % Strategy A: SLC template cancellation (range domain)
+    slc = sidelobe_cancellation(pc, reference_chip, main_idx, guard_half, 3);
+    sinr_slc_db = estimate_sinr_db(slc, ideal, main_idx, guard_half);
 
-    %% 策略 3: 副瓣匿影 + 脉冲压缩
-    try
-        sig_slb_raw = sidelobe_blanking(received_signal, 0.1, fs);
-        sig_slb_pc = pulse_compression(sig_slb_raw, reference_chip, fs);
-        sig_slb_pc = normalize_energy(sig_slb_pc, received_signal);
-        score_slb = get_correlation(sig_slb_pc, ideal_compressed);
-    catch
-        score_slb = -2; sig_slb_pc = received_signal;
-    end
+    % Strategy B: SLB blanking (range domain)
+    slb = sidelobe_blanking(pc, main_idx, guard_half, 0.2);
+    sinr_slb_db = estimate_sinr_db(slb, ideal, main_idx, guard_half);
 
-    %% 择优
-    scores = [score_pc, score_slc, score_slb];
-    [max_score, idx] = max(scores);
+    % Strategy C: SLC + SLB
+    slc_slb = sidelobe_blanking(slc, main_idx, guard_half, 0.2);
+    sinr_slc_slb_db = estimate_sinr_db(slc_slb, ideal, main_idx, guard_half);
+
+    sinr_all = [sinr_base_db, sinr_slc_db, sinr_slb_db, sinr_slc_slb_db];
+    [sinr_best_db, idx] = max(sinr_all);
 
     switch idx
         case 1
-            best_signal = sig_pc; strategy_name = 'PC';
+            best_pc = pc;
+            strategy_name = 'PC';
         case 2
-            best_signal = sig_slc_pc; strategy_name = 'SLC_PC';
+            best_pc = slc;
+            strategy_name = 'SLC';
         case 3
-            best_signal = sig_slb_pc; strategy_name = 'SLB_PC';
+            best_pc = slb;
+            strategy_name = 'SLB';
+        case 4
+            best_pc = slc_slb;
+            strategy_name = 'SLC+SLB';
     end
 
-    best_improvement = (max_score - base_corr) * 100;
+    sinr_improvement_db = sinr_best_db - sinr_base_db;
 end
 
-function r = get_correlation(sig1, sig2)
-    if length(sig1) ~= length(sig2)
-        L = min(length(sig1), length(sig2));
-        sig1 = sig1(1:L); sig2 = sig2(1:L);
-    end
-    % 使用相关系数的模，避免相位旋转影响
-    c = corrcoef(abs(sig1), abs(sig2));
-    r = c(1,2);
-    if isnan(r), r = 0; end
-end
+function sinr_db = estimate_sinr_db(y, ideal, main_idx, guard_half)
+%ESTIMATE_SINR_DB  Range-domain SINR-like metric using ideal response
+%   We estimate a complex scalar alpha on the protected mainlobe window to
+%   best match y ≈ alpha*ideal, then compute residual energy as interference+noise.
 
-function sig_out = normalize_energy(sig_in, ref_sig)
-    ratio = norm(ref_sig) / (norm(sig_in) + eps);
-    sig_out = sig_in * ratio;
+    y = y(:).';
+    ideal = ideal(:).';
+    N = min(length(y), length(ideal));
+    y = y(1:N);
+    ideal = ideal(1:N);
+
+    L = max(1, main_idx - guard_half);
+    R = min(N, main_idx + guard_half);
+    win = L:R;
+
+    % Least-squares complex scaling on mainlobe window
+    denom = sum(abs(ideal(win)).^2) + eps;
+    alpha = sum(y(win) .* conj(ideal(win))) / denom;
+
+    sig_energy = sum(abs(alpha * ideal(win)).^2);
+    err = y - alpha * ideal;
+
+    % Use full residual (including outside window) as interference+noise energy
+    in_energy = sum(abs(err).^2) + eps;
+
+    sinr_db = 10*log10(sig_energy / in_energy);
 end

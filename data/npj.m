@@ -1,34 +1,31 @@
-function NPJ = npj_paper(N, t, f_jam, JSR, signal_power, T_width, T_pri, num_pulses, start_time)
-% 依据论文公式 (6) 实现的窄脉冲干扰
-% N: 采样点数
-% t: 时间轴
-% f_jam: 干扰载频 (通常对准雷达频率)
-% JSR: 干信比 (dB)
-% signal_power: 信号功率
-% T_width: 脉冲宽度 (论文中的 T_np)
-% T_pri: 脉冲重复周期 (论文中的 tau_np)
-% num_pulses: 脉冲个数 (论文中的 N)
-% start_time: 起始时间 (论文中的 Theta)
+function NPJ = npj(N, t, f_jam, JSR_dB, signal_power, T_width, T_pri, num_pulses, start_time)
+%NPJ  Narrow-Pulse Jamming (窄脉冲干扰)
+%   在时间上发射一串宽度为 T_width、PRI 为 T_pri 的窄脉冲，
+%   幅度由 JSR_dB (相对 signal_power) 控制，并调制到载频 f_jam。
+%
+% 修复点:
+%   - 原 npj.m 中主函数名为 npj_paper，与文件名 npj.m 不匹配，MATLAB
+%     会导致“未定义函数 npj”。这里修复为 npj。
 
-    % 1. 计算干扰幅度
-    P_jam = signal_power * 10^(JSR/10);
+    if nargin < 9 || isempty(start_time)
+        start_time = 0;
+    end
+
+    % 1) 计算目标干扰幅度
+    P_jam = signal_power * 10^(JSR_dB/10);
     A = sqrt(P_jam);
-    
-    % 2. 生成脉冲包络 (矩形波串)
+
+    % 2) 生成脉冲包络
     envelope = zeros(1, N);
-    for k = 0 : num_pulses-1
-        % 计算每个脉冲的中心或起始位置
+    for k = 0:(num_pulses-1)
         t_start = start_time + k * T_pri;
         t_end = t_start + T_width;
-        
-        % 生成矩形窗 (Rect function)
-        % 在时间范围内置为 1
         envelope = envelope + (t >= t_start & t <= t_end);
     end
-    
-    % 3. 调制到高频 (加上载波)
-    % 论文提到是 "high-frequency, high-energy bursts"
+    envelope = min(envelope, 1); % 防止重叠>1
+
+    % 3) 载波调制
     carrier = exp(1i * 2 * pi * f_jam * t);
-    
+
     NPJ = A * envelope .* carrier;
 end

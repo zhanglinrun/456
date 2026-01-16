@@ -1,30 +1,41 @@
-function [processed_signal, SINR_improvement] = sidelobe_blanking(received_signal, threshold_factor, fs)
-% 副瓣匿影 (逻辑修正版：切除高功率干扰)
+function y = sidelobe_blanking(y_in, main_idx, guard_half_width, threshold_factor)
+%SIDELOBE_BLANKING  Sidelobe blanking in pulse-compressed (range) domain
+%   y = sidelobe_blanking(y_in, main_idx, guard_half_width, threshold_factor)
+%
+% Idea:
+%   Protect the mainlobe window [main_idx-guard_half_width, main_idx+guard_half_width].
+%   For samples outside this window, if |y|^2 exceeds threshold_factor * max_power,
+%   blank (set to 0). This is a simplified SLB model.
+%
+% Reference (concept):
+%   SLB is typically implemented using guard channels / thresholds to blank detections
+%   that lie in antenna sidelobes. (See e.g. SLB/SLC discussion in literature.)
 
-    if nargin < 2, threshold_factor = 0.1; end
-    
-    N = length(received_signal);
-    signal_power = abs(received_signal).^2;
-    
-    [max_power, max_idx] = max(signal_power);
-    threshold = max_power * threshold_factor;
-    
-    mask = ones(1, N);
-    
-    % 保护主瓣
-    window_size = floor(N * 0.05);
-    mainlobe_start = max(1, max_idx - window_size);
-    mainlobe_end = min(N, max_idx + window_size);
-    
-    for i = 1:N
-        if i < mainlobe_start || i > mainlobe_end
-            % 如果副瓣区域功率异常大（大于阈值），视为干扰并置零
-            if signal_power(i) > threshold 
-                mask(i) = 0; 
-            end
-        end
+    if nargin < 2 || isempty(main_idx)
+        % fallback: take peak of y_in
+        [~, main_idx] = max(abs(y_in));
     end
-    
-    processed_signal = received_signal .* mask;
-    SINR_improvement = 0; 
+    if nargin < 3 || isempty(guard_half_width)
+        guard_half_width = round(length(y_in) * 0.02); % default 2% of length
+    end
+    if nargin < 4 || isempty(threshold_factor)
+        threshold_factor = 0.2; % 20% of max power
+    end
+
+    y_in = y_in(:).';
+    N = length(y_in);
+    p = abs(y_in).^2;
+    p_max = max(p);
+    thr = p_max * threshold_factor;
+
+    y = y_in;
+
+    left = max(1, main_idx - guard_half_width);
+    right = min(N, main_idx + guard_half_width);
+
+    mask = true(1, N);
+    mask(left:right) = false; % false => protected
+
+    blank_idx = find(mask & (p > thr));
+    y(blank_idx) = 0;
 end

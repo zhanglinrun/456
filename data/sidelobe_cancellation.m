@@ -1,75 +1,79 @@
-function [processed_signal, SINR_improvement] = sidelobe_cancellation(received_signal, reference_signal, fs, B)
-% SIDELOBE_CANCELLATION 副瓣对消 (稳健版)
-% 修复了 LMS 梯度爆炸导致的 NaN 问题
+function y = sidelobe_cancellation(y_in, reference_chip, main_idx, guard_half_width, K)
+%SIDELOBE_CANCELLATION  Template-based sidelobe cancellation in range domain
+%   y = sidelobe_cancellation(y_in, reference_chip, main_idx, guard_half_width, K)
+%
+% This is a simplified SLC-like post-processing model (single-channel) intended
+% for simulation/dataset generation:
+%   1) Compute matched filter autocorrelation template r = conv(chip, conj(fliplr(chip)), 'same').
+%      This template represents the range response of an ideal point scatterer (mainlobe + sidelobes).
+%   2) Find strong peaks in |y_in| outside the protected mainlobe region of the true target.
+%   3) For each strong peak, subtract its scaled, shifted template r (mainlobe of that peak kept,
+%      but its sidelobes contribute interference to other ranges).
+%
+% NOTE:
+%   Real SLC often relies on auxiliary/guard channels or adaptive beamforming to cancel interference.
+%   Here we implement a single-channel surrogate that is useful for controlled experiments.
 
-    N = length(received_signal);
-    filter_length = min(32, floor(N/4)); 
-    
-    % --- 1. 安全预处理：归一化 ---
-    % 强干扰下幅度可能很大，导致 LMS 发散。先将幅度归一化到 1 以内。
-    max_val = max(abs(received_signal));
-    if max_val > 0
-        scale_factor = 1.0 / max_val;
-    else
-        scale_factor = 1.0;
+    if nargin < 3 || isempty(main_idx)
+        [~, main_idx] = max(abs(y_in));
     end
-    
-    % 归一化输入信号
-    rx_norm = received_signal * scale_factor;
-    ref_norm = reference_signal * scale_factor; 
-    
-    % --- 2. 算法参数 ---
-    % 减小步长，增加稳定性
-    mu = 0.001; 
-    
-    w = zeros(1, filter_length);
-    x_ref = [zeros(1, filter_length-1), rx_norm(1:end-filter_length+1)];
-    
-    out_norm = zeros(1, N);
-    
-    % 确保参考信号长度匹配
-    if length(ref_norm) > N
-        ref_norm = ref_norm(1:N);
-    elseif length(ref_norm) < N
-        ref_norm = [ref_norm, zeros(1, N-length(ref_norm))];
+    if nargin < 4 || isempty(guard_half_width)
+        guard_half_width = round(length(y_in) * 0.02);
+    end
+    if nargin < 5 || isempty(K)
+        K = 3; % cancel top-3 interference peaks
     end
 
-    % --- 3. LMS 迭代 ---
-    for n = filter_length:N
-        x_vec = x_ref(n-filter_length+1:n);
-        y_n = w * x_vec.';
-        
-        % 期望信号
-        d_n = ref_norm(n);
-        
-        % 计算误差 (作为对消后的输出)
-        % e = d - y; 
-        % 这里我们保留原始逻辑，将误差视为去干扰后的信号
-        out_norm(n) = rx_norm(n) - y_n;
-        
-        % 更新权重
-        update_step = mu * (ref_norm(n) - y_n) * conj(x_vec);
-        
-        % --- 关键保护：检查 NaN/Inf ---
-        if any(isnan(update_step)) || any(isinf(update_step))
-            % 如果梯度爆炸，不再更新权重，保持上一时刻的值或重置
-            % w = zeros(1, filter_length); % 可选：重置
-        else
-            w = w + update_step;
-        end
+    y_in = y_in(:).';
+    N = length(y_in);
+
+    % Autocorrelation template (range response)
+    chip = reference_chip(:).';
+    thr = max(abs(chip)) * 1e-4;
+    idx = find(abs(chip) > thr);
+    if ~isempty(idx)
+        chip = chip(idx(1):idx(end));
     end
-    
-    % 填充起始段
-    out_norm(1:filter_length-1) = rx_norm(1:filter_length-1);
-    
-    % --- 4. 还原幅度 ---
-    processed_signal = out_norm / scale_factor;
-    
-    % --- 5. 最终防线 ---
-    % 如果仍有 NaN（极罕见），回退到原始信号，防止画图报错
-    if any(~isfinite(processed_signal))
-        processed_signal = received_signal;
+    r = conv(chip, conj(fliplr(chip)), 'same');
+    % Normalize template peak to 1
+    [~, r0] = max(abs(r));
+    r = r / (r(r0) + eps);
+
+    y = y_in;
+
+    % Protect target mainlobe region
+    protect = false(1, N);
+    L = max(1, main_idx - guard_half_width);
+    R = min(N, main_idx + guard_half_width);
+    protect(L:R) = true;
+
+    % Find candidate peaks outside protected region
+    mag = abs(y_in);
+    mag(protect) = 0;
+
+    % Simple peak picking: take top-K sample indices
+    [~, sorted_idx] = sort(mag, 'descend');
+    peak_idx = sorted_idx(1:min(K, numel(sorted_idx)));
+    peak_idx = peak_idx(mag(peak_idx) > 0);
+
+    for ii = 1:numel(peak_idx)
+        k = peak_idx(ii);
+        a = y_in(k); % complex amplitude at peak
+
+        % Build shifted template centered at k
+        % r is centered at r0; shift amount = k - r0
+        shift = k - r0;
+        r_shift = circshift(r, [0, shift]);
+
+        % Subtract scaled template, but keep a small protected window around k itself
+        % to avoid nuking the peak completely (optional)
+        local_guard = round(guard_half_width * 0.5);
+        kL = max(1, k - local_guard);
+        kR = min(N, k + local_guard);
+
+        tmp = a * r_shift;
+        tmp(kL:kR) = 0; % do not subtract near the peak mainlobe
+
+        y = y - tmp;
     end
-    
-    SINR_improvement = 0; 
 end
